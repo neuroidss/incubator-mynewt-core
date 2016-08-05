@@ -35,6 +35,7 @@ typedef int host_hci_event_fn(uint8_t event_code, uint8_t *data, int len);
 static host_hci_event_fn host_hci_rx_disconn_complete;
 static host_hci_event_fn host_hci_rx_encrypt_change;
 static host_hci_event_fn host_hci_rx_num_completed_pkts;
+static host_hci_event_fn host_hci_rx_enc_key_refresh;
 static host_hci_event_fn host_hci_rx_le_meta;
 
 typedef int host_hci_le_event_fn(uint8_t subevent, uint8_t *data, int len);
@@ -68,6 +69,7 @@ static const struct host_hci_event_dispatch_entry host_hci_event_dispatch[] = {
     { BLE_HCI_EVCODE_DISCONN_CMP, host_hci_rx_disconn_complete },
     { BLE_HCI_EVCODE_ENCRYPT_CHG, host_hci_rx_encrypt_change },
     { BLE_HCI_EVCODE_NUM_COMP_PKTS, host_hci_rx_num_completed_pkts },
+    { BLE_HCI_EVCODE_ENC_KEY_REFRESH, host_hci_rx_enc_key_refresh },
     { BLE_HCI_EVCODE_LE_META, host_hci_rx_le_meta },
 };
 
@@ -87,6 +89,7 @@ static const struct host_hci_le_event_dispatch_entry
     { BLE_HCI_LE_SUBEV_CONN_UPD_COMPLETE, host_hci_rx_le_conn_upd_complete },
     { BLE_HCI_LE_SUBEV_LT_KEY_REQ, host_hci_rx_le_lt_key_req },
     { BLE_HCI_LE_SUBEV_REM_CONN_PARM_REQ, host_hci_rx_le_conn_parm_req },
+    { BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE, host_hci_rx_le_conn_complete },
 };
 
 #define HOST_HCI_LE_EVENT_DISPATCH_SZ \
@@ -132,7 +135,7 @@ host_hci_le_dispatch_entry_find(uint8_t event_code)
     const struct host_hci_le_event_dispatch_entry *entry;
     int i;
 
-    for (i = 0; i < HOST_HCI_EVENT_DISPATCH_SZ; i++) {
+    for (i = 0; i < HOST_HCI_LE_EVENT_DISPATCH_SZ; i++) {
         entry = host_hci_le_event_dispatch + i;
         if (entry->hmd_subevent == event_code) {
             return entry;
@@ -148,7 +151,7 @@ host_hci_rx_disconn_complete(uint8_t event_code, uint8_t *data, int len)
     struct hci_disconn_complete evt;
 
     if (len < BLE_HCI_EVENT_DISCONN_COMPLETE_LEN) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     evt.status = data[2];
@@ -173,7 +176,24 @@ host_hci_rx_encrypt_change(uint8_t event_code, uint8_t *data, int len)
     evt.connection_handle = le16toh(data + 3);
     evt.encryption_enabled = data[5];
 
-    ble_l2cap_sm_rx_encryption_change(&evt);
+    ble_sm_enc_change_rx(&evt);
+
+    return 0;
+}
+
+static int
+host_hci_rx_enc_key_refresh(uint8_t event_code, uint8_t *data, int len)
+{
+    struct hci_encrypt_key_refresh evt;
+
+    if (len < BLE_HCI_EVENT_ENC_KEY_REFRESH_LEN) {
+        return BLE_HS_ECONTROLLER;
+    }
+
+    evt.status = data[2];
+    evt.connection_handle = le16toh(data + 3);
+
+    ble_sm_enc_key_refresh_rx(&evt);
 
     return 0;
 }
@@ -188,14 +208,14 @@ host_hci_rx_num_completed_pkts(uint8_t event_code, uint8_t *data, int len)
     int i;
 
     if (len < BLE_HCI_EVENT_HDR_LEN + BLE_HCI_EVENT_NUM_COMP_PKTS_HDR_LEN) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     off = BLE_HCI_EVENT_HDR_LEN;
     num_handles = data[off];
     if (len < BLE_HCI_EVENT_NUM_COMP_PKTS_HDR_LEN +
               num_handles * BLE_HCI_EVENT_NUM_COMP_PKTS_ENT_LEN) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
     off++;
 
@@ -220,7 +240,7 @@ host_hci_rx_le_meta(uint8_t event_code, uint8_t *data, int len)
 
     if (len < BLE_HCI_EVENT_HDR_LEN + BLE_HCI_LE_MIN_LEN) {
         /* XXX: Increment stat. */
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     subevent = data[2];
@@ -240,10 +260,17 @@ static int
 host_hci_rx_le_conn_complete(uint8_t subevent, uint8_t *data, int len)
 {
     struct hci_le_conn_complete evt;
+    int extended_offset = 0;
     int rc;
 
     if (len < BLE_HCI_LE_CONN_COMPLETE_LEN) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
+    }
+
+    /* this code processes two different events that are really similar */
+    if ((subevent == BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE) &&
+        ( len < BLE_HCI_LE_ENH_CONN_COMPLETE_LEN)) {
+        return BLE_HS_ECONTROLLER;
     }
 
     evt.subevent_code = data[0];
@@ -252,10 +279,22 @@ host_hci_rx_le_conn_complete(uint8_t subevent, uint8_t *data, int len)
     evt.role = data[4];
     evt.peer_addr_type = data[5];
     memcpy(evt.peer_addr, data + 6, BLE_DEV_ADDR_LEN);
-    evt.conn_itvl = le16toh(data + 12);
-    evt.conn_latency = le16toh(data + 14);
-    evt.supervision_timeout = le16toh(data + 16);
-    evt.master_clk_acc = data[18];
+
+    /* enhanced connection event has the same information with these
+     * extra fields stuffed into the middle */
+    if (subevent == BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE) {
+        memcpy(evt.local_rpa, data + 12, BLE_DEV_ADDR_LEN);
+        memcpy(evt.peer_rpa, data + 18, BLE_DEV_ADDR_LEN);
+        extended_offset = 12;
+    } else {
+        memset(evt.local_rpa, 0, BLE_DEV_ADDR_LEN);
+        memset(evt.peer_rpa, 0, BLE_DEV_ADDR_LEN);
+    }
+
+    evt.conn_itvl = le16toh(data + 12 + extended_offset);
+    evt.conn_latency = le16toh(data + 14 + extended_offset);
+    evt.supervision_timeout = le16toh(data + 16 + extended_offset);
+    evt.master_clk_acc = data[18 + extended_offset];
 
     if (evt.status == 0) {
         if (evt.role != BLE_HCI_LE_CONN_COMPLETE_ROLE_MASTER &&
@@ -283,7 +322,7 @@ host_hci_le_adv_rpt_first_pass(uint8_t *data, int len,
     int i;
 
     if (len < BLE_HCI_LE_ADV_RPT_MIN_LEN) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     num_reports = data[1];
@@ -299,7 +338,7 @@ host_hci_le_adv_rpt_first_pass(uint8_t *data, int len,
            6        /* Address. */
           ) * num_reports;
     if (off + num_reports >= len) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     data_len = 0;
@@ -312,7 +351,7 @@ host_hci_le_adv_rpt_first_pass(uint8_t *data, int len,
 
     /* Check if RSSI fields fit in the packet. */
     if (off + num_reports > len) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     *out_num_reports = num_reports;
@@ -370,7 +409,7 @@ host_hci_rx_le_conn_upd_complete(uint8_t subevent, uint8_t *data, int len)
     struct hci_le_conn_upd_complete evt;
 
     if (len < BLE_HCI_LE_CONN_UPD_LEN) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     evt.subevent_code = data[0];
@@ -417,7 +456,7 @@ host_hci_rx_le_lt_key_req(uint8_t subevent, uint8_t *data, int len)
     evt.random_number = le64toh(data + 3);
     evt.encrypted_diversifier = le16toh(data + 11);
 
-    ble_l2cap_sm_rx_lt_key_req(&evt);
+    ble_sm_ltk_req_rx(&evt);
 
     return 0;
 }
@@ -428,7 +467,7 @@ host_hci_rx_le_conn_parm_req(uint8_t subevent, uint8_t *data, int len)
     struct hci_le_conn_param_req evt;
 
     if (len < BLE_HCI_LE_REM_CONN_PARM_REQ_LEN) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     evt.subevent_code = data[0];
@@ -576,7 +615,7 @@ host_hci_data_hdr_strip(struct os_mbuf *om, struct hci_data_hdr *hdr)
 
     rc = os_mbuf_copydata(om, 0, BLE_HCI_DATA_HDR_SZ, hdr);
     if (rc != 0) {
-        return BLE_HS_EMSGSIZE;
+        return BLE_HS_ECONTROLLER;
     }
 
     /* Strip HCI ACL data header from the front of the packet. */

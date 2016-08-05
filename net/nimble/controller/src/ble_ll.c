@@ -33,6 +33,8 @@
 #include "controller/ble_ll_sched.h"
 #include "controller/ble_ll_scan.h"
 #include "controller/ble_ll_hci.h"
+#include "controller/ble_ll_whitelist.h"
+#include "controller/ble_ll_resolv.h"
 #include "ble_ll_conn_priv.h"
 #include "hal/hal_cputime.h"
 
@@ -286,11 +288,28 @@ ble_ll_chk_txrx_time(uint16_t time)
     return rc;
 }
 
+/**
+ * Checks to see if the address is a resolvable private address.
+ *
+ * NOTE: the addr_type parameter will be 0 if the address is public;
+ * any other value is random (all non-zero values).
+ *
+ * @param addr
+ * @param addr_type Public (zero) or Random (non-zero) address
+ *
+ * @return int
+ */
 int
-ble_ll_is_resolvable_priv_addr(uint8_t *addr)
+ble_ll_is_rpa(uint8_t *addr, uint8_t addr_type)
 {
-    /* XXX: implement this */
-    return 0;
+    int rc;
+
+    if (addr_type && ((addr[5] & 0xc0) == 0x40)) {
+        rc = 1;
+    } else {
+        rc = 0;
+    }
+    return rc;
 }
 
 /* Checks to see that the device is a valid random address */
@@ -368,7 +387,7 @@ ble_ll_set_random_addr(uint8_t *addr)
  * @param addr
  * @param addr_type
  *
- * @return int
+ * @return int 0: not our device address. 1: is our device address
  */
 int
 ble_ll_is_our_devaddr(uint8_t *addr, int addr_type)
@@ -648,6 +667,7 @@ ble_ll_rx_start(struct os_mbuf *rxpdu, uint8_t chan)
     int rc;
     uint8_t pdu_type;
     uint8_t *rxbuf;
+    struct ble_mbuf_hdr *ble_hdr;
 
     ble_ll_log(BLE_LL_LOG_ID_RX_START, chan, 0, (uint32_t)rxpdu);
 
@@ -659,11 +679,8 @@ ble_ll_rx_start(struct os_mbuf *rxpdu, uint8_t chan)
          * ongoing connection
          */
         if (g_ble_ll_data.ll_state == BLE_LL_STATE_CONNECTION) {
-            /* Call conection pdu rx start function */
-            ble_ll_conn_rx_isr_start();
-
-            /* Set up to go from rx to tx */
-            rc = 1;
+            ble_hdr = BLE_MBUF_HDR_PTR(rxpdu);
+            rc = ble_ll_conn_rx_isr_start(ble_hdr, ble_phy_access_addr_get());
         } else {
             STATS_INC(ble_ll_stats, bad_ll_state);
             rc = 0;
@@ -759,7 +776,7 @@ ble_ll_rx_end(struct os_mbuf *rxpdu, struct ble_mbuf_hdr *ble_hdr)
          * Data channel pdu. We should be in CONNECTION state with an
          * ongoing connection.
          */
-        rc = ble_ll_conn_rx_isr_end(rxpdu, ble_phy_access_addr_get());
+        rc = ble_ll_conn_rx_isr_end(rxpdu);
         return rc;
     }
 
@@ -805,7 +822,6 @@ ble_ll_rx_end(struct os_mbuf *rxpdu, struct ble_mbuf_hdr *ble_hdr)
             STATS_INC(ble_ll_stats, rx_adv_malformed_pkts);
             os_mbuf_free_chain(rxpdu);
             rxpdu = NULL;
-            rc = -1;
         }
     }
 
@@ -1065,6 +1081,14 @@ ble_ll_reset(void)
     /* Reset our random address */
     memset(g_random_addr, 0, BLE_DEV_ADDR_LEN);
 
+    /* Clear the whitelist */
+    ble_ll_whitelist_clear();
+
+    /* Reset resolving list */
+#if (BLE_LL_CFG_FEAT_LL_PRIVACY == 1)
+    ble_ll_resolv_list_reset();
+#endif
+
     /* Re-initialize the PHY */
     rc = ble_phy_init();
 
@@ -1134,6 +1158,15 @@ ble_ll_init(uint8_t ll_task_prio, uint8_t num_acl_pkts, uint16_t acl_pkt_size)
 #endif
 #if (BLE_LL_CFG_FEAT_LE_ENCRYPTION == 1)
     features |= BLE_LL_FEAT_LE_ENCRYPTION;
+#endif
+
+#if (BLE_LL_CFG_FEAT_LL_PRIVACY == 1)
+    features |= (BLE_LL_FEAT_LL_PRIVACY | BLE_LL_FEAT_EXT_SCAN_FILT);
+    ble_ll_resolv_init();
+#endif
+
+#if (BLE_LL_CFG_FEAT_LE_PING == 1)
+    features |= BLE_LL_FEAT_LE_PING;
 #endif
 
     /* Initialize random number generation */
